@@ -1,0 +1,85 @@
+name: Build Mac downloads
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  mac:
+    name: macOS ${{ matrix.arch }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Restore released app and Mac packaging
+        run: |
+          python3 - <<'PY'
+          import base64,hashlib,urllib.request,zipfile
+          from pathlib import Path,PurePosixPath
+          url='https://github.com/sebmansfield/exam-mistake-tracker-downloads/releases/download/v10.0.2/Exam-Mistake-Tracker-V10.0.2.emtupdate'
+          urllib.request.urlretrieve(url,'base.emtupdate')
+          assert hashlib.sha256(Path('base.emtupdate').read_bytes()).hexdigest()=='03a900275a5053aab38b68388156fd868aeae5b78cc9b6b876fb92f27a582e7f'
+          root=Path('source');root.mkdir()
+          with zipfile.ZipFile('base.emtupdate') as z:
+           for name in z.namelist():
+            rel=PurePosixPath(name)
+            if rel.parts[0] not in ('app','tracker'):continue
+            assert not rel.is_absolute() and '..' not in rel.parts
+            dest=root/('desktop' if rel.parts[0]=='app' else '')/Path(*rel.parts[1:])
+            dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(z.read(name))
+          blob=base64.b64decode(Path('build/macos-source-overlay.b64').read_bytes())
+          assert hashlib.sha256(blob).hexdigest()=='527c4927cadd946011a1e268ff29f29e6e2609999b1d02a73b6c93652a331a21'
+          Path('overlay.zip').write_bytes(blob)
+          with zipfile.ZipFile('overlay.zip') as z:z.extractall(root)
+          PY
+      - name: Build app with bundled runtime
+        run: |
+          npm install --prefix source/macos --ignore-scripts --no-audit --no-fund
+          python3 source/macos/build.py --arch '${{ matrix.arch }}' --output build-output
+      - name: Backend regression checks
+        working-directory: source
+        run: |
+          app=$(cat ../build-output/app-path.txt)
+          "$app/Contents/Resources/python/bin/python3" -B -m unittest discover -s tests -p 'test*.py' -v > ../build-output/backend-tests.txt 2>&1
+      - name: Packaged app, browser and signed-update checks
+        env:
+          MAC_ARCH: ${{ matrix.arch }}
+          MAC_BUILD_OUT: ${{ github.workspace }}/build-output
+        run: |
+          npx --prefix source/macos playwright install chromium
+          node --test source/macos/smoke.test.cjs > build-output/native-tests.txt 2>&1
+          app=$(cat build-output/app-path.txt)
+          export TRACKER_TEST_PYTHON="$app/Contents/Resources/python/bin/python3"
+          node --test source/tests/updates.test.js > build-output/update-tests.txt 2>&1
+      - name: Package verified app
+        run: python3 source/macos/package-dmg.py build-output '${{ matrix.arch }}'
+      - name: Publish Mac download beside Windows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload v10.0.2 build-output/*.dmg --repo '${{ github.repository }}' --clobber
+      - name: Save verification reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macOS-${{ matrix.arch }}-reports
+          retention-days: 1
+          path: |
+            build-output/*tests.txt
+            build-output/*.sha256
+            build-output/*.png
+            build-output/APP_MANIFEST.json
